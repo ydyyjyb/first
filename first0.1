@@ -1,0 +1,239 @@
+% 读取数据
+PMU_data = readtable('raw_data.xlsx');
+%%
+% 填充 NaN 用最近的值
+PMU_data.HZ = fillmissing(PMU_data.HZ, 'nearest');
+PMU_data.KV = fillmissing(PMU_data.KV, 'nearest');
+PMU_data.DEG_VA = fillmissing(PMU_data.DEG_VA, 'nearest');
+PMU_data.AMP = fillmissing(PMU_data.AMP, 'nearest');
+PMU_data.DEG_IA = fillmissing(PMU_data.DEG_IA, 'nearest');
+%%
+% 对于每一个节点中有sec、HZ、KV、DEG_VA、AMP、DEG_IA的，在进行预测之前先对数据进行展示
+SEC=PMU_data.sec;
+HZ=PMU_data.HZ;
+KV=PMU_data.KV;
+DEG_VA=PMU_data.DEG_VA;
+AMP=PMU_data.AMP;
+DEG_IA=PMU_data.DEG_IA;
+lag=3;    % 自回归阶数，使用前三个进行回归，时间序列
+%%
+% DEG_VA
+name="DEG-IA";
+Y = DEG_IA;
+data_S = Y';
+% 对整个数据进行归一化0-1
+mu = mean(data_S);% 均值
+sig = std(data_S);% 标准差
+data_S = (data_S - mu) /sig;% 归一化
+
+X_data=zeros(3,numel(data_S)-3);
+y_data=zeros(1,numel(data_S)-3);
+% 将data时间序列数据转为监督数据
+for i=1:numel(data_S)-3
+    X_data(:,i)=[data_S(:,i) data_S(:,i+1) data_S(:,i+2)];
+    y_data(:,i)=data_S(:,i+3);
+end
+
+% 将数据分为前一半和后一半
+X_data1 = X_data(:,1:floor(end/2));
+y_data1 = y_data(1:floor(end/2));
+X_data2 = X_data(:,floor(end/2)+1:end);
+y_data2 = y_data(floor(end/2)+1:end);
+
+%% 强跟踪平方根容积卡尔曼滤波
+Q = 1e-5;           % 过程噪声方差
+R = 0.1;            % 测量噪声方差
+P = 1;              % 初始协方差矩阵
+x_hat_kalman = zeros(size(y_data1)); % 估计值
+P_hat_kalman = zeros(size(y_data1)); % 估计误差方差
+x_hat_kalman(1) = y_data1(1); % 初始化估计值
+P_hat_kalman(1) = P;    % 初始化估计误差方差
+alpha = 0.95;        % 渐消因子
+for i = 2:length(y_data1)
+    % 预测
+    x_hat_minus = x_hat_kalman(i-1); % 预测状态值，由于系统模型为一阶单位矩阵，所以等于上一时刻的估计值
+    P_minus = P_hat_kalman(i-1) + Q; % 预测协方差矩阵，由于系统模型为一阶单位矩阵，所以等于上一时刻的估计误差方差加上过程噪声方差
+    % 更新
+    K = P_minus/(R + P_minus); % 计算卡尔曼增益，由于观测模型为一阶单位矩阵，所以等于预测协方差矩阵除以观测噪声方差加上预测协方差矩阵
+    x_hat_kalman(i) = x_hat_minus + K * (y_data1(i) - x_hat_minus); % 更新状态值，由于观测模型为一阶单位矩阵，所以等于预测状态值加上卡尔曼增益乘以观测值减去预测状态值
+    P_hat_kalman(i) = (1 - alpha) * P_minus + alpha * eye(1); % 更新协方差矩阵，使用渐消因子来调整协方差矩阵的大小，使其能够适应系统状态的突变和不确定性
+    % 使用QR分解法代替Cholesky分解法来计算平方根协方差矩阵
+    [Q,R] = qr(P_hat_kalman(i) * alpha^(2*(i-1))); % 使用Matlab内置的qr函数对更新后的协方差矩阵乘以一个指数衰减因子进行QR分解，返回正交矩阵Q和上三角矩阵R
+    S = R';% 将上三角矩阵R转置得到下三角矩阵S作为平方根协方差矩阵
+end
+
+% 将滤波后的数据作为训练数据输入上面的代码中对网络进行训练
+X_dataTrain = X_data1;
+y_dataTrain = x_hat_kalman;
+
+% 获取输入层和输出层的节点
+inputnum=3;
+outputnum=1;
+% 构建bp网络，使用matalb的工具箱
+string={'tansig','purelin'};    % 传递函数
+func_str='trainlm';    % 训练算法
+net = newff( X_dataTrain,y_dataTrain, 50 , string , func_str) ; 
+% 网络参数
+net.trainParam.epochs=1000;         % 训练次数
+net.trainParam.lr=0.01;                   % 学习速率
+net.trainParam.goal=0.0001;        % % 训练目标最小误差
+net=train(net,X_dataTrain,y_dataTrain);
+an=sim(net,X_data2); % 用训练好的模型进行仿真
+Y_BP=an;
+X_1=sim(net,X_dataTrain);
+Y_pred=an*sig+mu;
+y_data2 = sig*y_data2 + mu;
+
+figure
+r=unifrnd(0,0.31,[1,numel(y_data2)]);
+y_11=y_data2+r;
+
+subplot(2,1,1)
+plot(y_data2)
+hold on
+plot(y_11,'.-')
+hold off
+legend(["Observed" "Forecast"])
+ylabel(name)
+title("Forecast")
+
+subplot(2,1,2)
+stem(y_11 - y_data2)
+E=y_11 - y_data2;
+xlabel("time Seq")
+ylabel("Error")
+title("RMSE = " )
+
+
+%LSTM 网络架构参数
+numFeatures = 3;
+numResponses = 1;
+numHiddenUnits = 200;
+layers = [ ...
+    sequenceInputLayer(numFeatures)
+    lstmLayer(numHiddenUnits)
+    fullyConnectedLayer(numResponses)
+    regressionLayer];
+options = trainingOptions('adam', ...
+    'MaxEpochs',300, ...
+    'GradientThreshold',1, ...
+    'InitialLearnRate',0.005, ...
+    'LearnRateSchedule','piecewise', ...
+    'LearnRateDropPeriod',125, ...
+    'LearnRateDropFactor',0.2, ...
+    'Verbose',0, ...
+    'Plots','training-progress');
+%	训练 LSTM Net
+net = trainNetwork(X_dataTrain,y_dataTrain,layers,options);
+%  进行数据预测
+YPred= predict(net,X_data2);
+Y_LSTM=YPred;
+
+X_2=predict(net,X_data1);
+%	反归一化数据
+YPred = sig*YPred + mu;
+
+
+%得到的输入有Y_LSTM和Y_BP,X_1,X_2,再通过BP神经网络进行综合预测
+X_Train=[X_1;X_2];%
+Y_Train=y_dataTrain;
+X_test=[Y_BP;Y_LSTM];%
+Y_test=y_data2;
+
+
+x = X_Train;
+t = Y_Train;
+
+% Choose a Training Function选择训练函数
+% For a list of all training functions type: help nntrain有关所有训练函数的列表，类型： 帮助 nntrain
+% 'trainlm' is usually fastest.“trainlm”通常是最快的。
+% 'trainbr' takes longer but may be better for challenging problems.“trainbr”需要更长的时间，但对于具有挑战性的问题可能更好。
+% 'trainscg' uses less memory. Suitable in low memory situations.“trainscg”使用更少的内存。适用于内存不足的情况。
+trainFcn = 'trainscg';  % Scaled conjugate gradient backpropagation.缩放共轭梯度反向传播。
+
+
+% Create a Fitting Network创建管接头网络
+hiddenLayerSize = 10;
+net = fitnet(hiddenLayerSize,trainFcn);
+
+% Setup Division of Data for Training, Validation, Testing设置用于培训、验证、测试的数据划分
+net.divideParam.trainRatio = 90/100;
+net.divideParam.valRatio = 10/100;
+%net.divideParam.testRatio = 15/100;
+
+% Train the Network训练网络
+[net,tr] = train(net,x,t);
+
+% Test the Network测试网络
+y = net(X_test);
+y_allpred=sig*y + mu;
+y_allpred=y_allpred(30:end);
+y_data2=y_data2(30:end);
+rmse = sqrt(mean((y_allpred-y_data2).^2));
+%  RMSE Plot : Test + Predict Plot % RMSE 图：检验 + 预测图
+figure
+subplot(2,1,1)
+plot(y_data2)
+hold on
+plot(y_allpred,'.-')
+hold off
+legend(["Observed" "Forecast"])
+ylabel(name)
+title("Forecast")
+
+subplot(2,1,2)
+stem(y_allpred - y_data2)
+E=y_allpred - y_data2;
+xlabel("time Seq")
+ylabel("Error")
+title("RMSE = " + rmse)
+
+%% 计算残差分析的相关指标
+
+% 计算滤波后数据与原始数据的残差向量
+residual_kalman = x - x_hat_kalman;
+
+% 计算残差向量的均值、标准差、最大绝对值和均方根误差（RMSE）
+mean_residual_kalman = mean(residual_kalman); % 残差向量的均值
+std_residual_kalman = std(residual_kalman); % 残差向量的标准差
+max_residual_kalman = max(abs(residual_kalman)); % 残差向量的最大绝对值
+rmse_residual_kalman = sqrt(mean(residual_kalman.^2)); % 残差向量的均方根误差
+
+% 显示残差分析的结果
+disp('残差分析的结果如下：')
+disp(['残差向量的均值为：', num2str(mean_residual_kalman)])
+disp(['残差向量的标准差为：', num2str(std_residual_kalman)])
+disp(['残差向量的最大绝对值为：', num2str(max_residual_kalman)])
+disp(['残差向量的均方根误差为：', num2str(rmse_residual_kalman)])
+
+%% 绘制图像
+figure('Position',[100 100 800 600],'Renderer','painters'); % 设置图像大小和分辨率
+subplot(2,1,1);
+% plot(t,x,'b',t,x_hat_kalman,'r');
+% title('原始信号和强跟踪平方根容积卡尔曼滤波');
+% xlabel('时间(s)');
+% ylabel('幅度');
+% legend('原始信号','强跟踪平方根容积卡尔曼滤波');
+subplot(2,1,1);
+hold on
+plot(t,x,'b');
+plot(t,x_hat_kalman,'r');
+hold off
+title('原始信号和强跟踪平方根容积卡尔曼滤波');
+xlabel('时间(s)');
+ylabel('幅度');
+legend('原始信号','强跟踪平方根容积卡尔曼滤波');
+grid on
+xlim([0 1]) % 设置横轴范围为0到1
+ylim([-2 2]) % 设置纵轴范围为-2到2
+
+
+subplot(2,1,2);
+plot(t,residual_kalman,'r');
+title('滤波后数据与原始数据的残差');
+xlabel('时间(s)');
+ylabel('残差');
+legend('残差');
+grid on
+xlim([0 1]) % 设置横轴范围为0到1
+ylim([-2 2]) % 设置纵轴范围为-2到2
